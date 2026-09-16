@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+lens_2stage_inference.py — 네오비전 렌즈 검사 2-stage 추론 (공장 배포용, 단독 실행).
+
+파이프라인
+  Stage1  EfficientNet-B0            224x224 / ImageNet norm  → color / tint / empty
+  Stage2A Color  ConvNeXt-L(4ch)     512x512 / RGB+Otsu       idx0=NG  thr=0.57
+  Stage2B Tint   ConvNeXt-L(4ch)     384x384 / RGB+median     idx0=NG  thr=0.50
+  empty                             → 즉시 NG (Stage2 없음)
+  판정: p_ng >= threshold → NG.   p_ng = softmax[:,0].
+
+전처리는 실제 학습/평가 코드와 1:1 동일:
+  - Stage1  = step2_classify_batch.py
+  - Color   = lens_factory_kit/common_train.py (512/Otsu/MEAN4·STD4)  ← 컬러 KPI 산출 코드
+  - Tint    = tint_common.py (384/median/MEAN4·STD4)                  ← 틴트 v3 학습/평가 코드
+  검증: 컬러 test 11,905장 @0.57(>=,정정114) → TP=1374/FP=27/FN=26/TN=10478 재현 (--selftest-color).
+
+⚠️ 2-stage 전체 성능은 Stage1 라우팅 오분류(color↔tint↔empty)를 포함한다.
+   즉 개별 Stage2 단독 KPI보다 낮을 수 있으며, 라우팅 오류가 최종 오판으로 전파된다.
+
+사용 예
+  단일 :  python lens_2stage_inference.py --input path/to/img.jpg
+  폴더 :  python lens_2stage_inference.py --input path/to/folder            (하위폴더 재귀)
+  대량 :  python lens_2stage_inference.py --input folder --batch 32         (선택 batch, 결과 동일)
+  검증 :  python lens_2stage_inference.py --selftest-color
+CSV → inference_results/lens_2stage_inference_YYYYMMDD_HHMMSS.csv (덮어쓰기 없음)
+
+Windows(RTX 5080) 대응: 상대경로(__file__ 기준), workers 기본 0, __main__ 가드, utf-8.
+"""
+import argparse
+import csv
+import datetime as _dt
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from torchvision import transforms
+from torchvision.models import efficientnet_b0
+from timm import create_model
+from PIL import Image, ImageFile
+
+# 학습/캐시와 동일하게 truncated 허용(전처리 일치). 완전 손상 파일은 open 단계에서 예외 → 개별 기록.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+try:
+    from skimage.filters import threshold_otsu
+    _HAS_OTSU = True
+except Exception:
+    _HAS_OTSU = False
+
+# ── 경로/상수 (전부 __file__ 기준) ───────────────────────────────────────────
+BASE = Path(__file__).resolve().parent
+WEIGHTS = BASE / "weights"
+STAGE1_W = WEIGHTS / "best_efficientnet_lens_3class.pth"
+COLOR_W  = WEIGHTS / "lens_hardneg_best.pth"
+TINT_W   = WEIGHTS / "lens_tint_v3_best.pth"
+COLOR_THR = 0.57
+TINT_THR  = 0.50
+STAGE1_CLASSES = ["color", "tint", "empty"]      # argmax 0/1/2
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+MEAN4 = torch.tensor([0.485, 0.456, 0.406, 0.5]).view(4, 1, 1)
+STD4  = torch.tensor([0.229, 0.224, 0.225, 0.5]).view(4, 1, 1)
+_STAGE1_TFM = transforms.Compose([
+    transforms.Resize((224, 224)), transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+
+# ── 전처리 (학습/평가 코드와 1:1) ────────────────────────────────────────────
+def pre_stage1(img):
+    return _STAGE1_TFM(img)                                   # (3,224,224)
+
+def pre_color(img):                                           # 512 / Otsu
+    x = TF.to_tensor(TF.resize(img, (512, 512)))
+    g = 0.2989 * x[0] + 0.5870 * x[1] + 0.1140 * x[2]
+    gn = g.numpy().astype("float32")
+    try:
+        thr = float(threshold_otsu(gn)) if _HAS_OTSU else float(gn.mean())
+    except Exception:
+        thr = float(gn.mean())
+    b = (g > thr).float().unsqueeze(0)
+    return (torch.cat([x, b], 0) - MEAN4) / STD4              # (4,512,512)
+
+def pre_tint(img):                                            # 384 / median
+    x = TF.to_tensor(TF.resize(img, (384, 384)))
+    g = 0.2989 * x[0] + 0.5870 * x[1] + 0.1140 * x[2]
+    b = (g > g.median()).float().unsqueeze(0)
+    return (torch.cat([x, b], 0) - MEAN4) / STD4              # (4,384,384)
+
+# ── 모델 로드 (strict=True) ──────────────────────────────────────────────────
+def _load_sd(p):
+    sd = torch.load(str(p), map_location="cpu")
+    if isinstance(sd, dict) and "model" in sd:      sd = sd["model"]
+    elif isinstance(sd, dict) and "state_dict" in sd: sd = sd["state_dict"]
+    return {k.replace("module.", "", 1) if k.startswith("module.") else k: v for k, v in sd.items()}
+
+def build_stage1(device):
+    m = efficientnet_b0(num_classes=3)
+    m.load_state_dict(_load_sd(STAGE1_W), strict=True)
+    return m.to(device).eval()
+
+def build_4ch(wp, device):
+    m = create_model("convnext_large_in22k", pretrained=False, num_classes=2)
+    old = m.stem[0]
+    nc = nn.Conv2d(4, old.out_channels, old.kernel_size, old.stride,
+                   old.padding, bias=(old.bias is not None))
+    with torch.no_grad():
+        nc.weight[:, :3] = old.weight
+        nc.weight[:, 3] = old.weight.mean(dim=1)
+        if old.bias is not None:
+            nc.bias = old.bias
+    m.stem[0] = nc
+    m.load_state_dict(_load_sd(wp), strict=True)
+    return m.to(device).eval()
+
+class Models:
+    def __init__(self, device, want_color=True, want_tint=True):
+        self.device = device
+        self.stage1 = build_stage1(device)
+        self.color = build_4ch(COLOR_W, device) if want_color else None
+        self.tint  = build_4ch(TINT_W, device) if want_tint else None
+
+# ── 추론 코어 (batch=1도 batch>1도 동일 경로 → 결과 동일 보장) ────────────────
+def _amp_ctx(use_amp, device):
+    if use_amp and device.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.float16)
+    import contextlib
+    return contextlib.nullcontext()
+
+@torch.inference_mode()
+def classify_chunk(paths, M, use_amp):
+    """paths(1~bs개) → 각 이미지 결과 dict 리스트. 손상 이미지는 개별 error 기록."""
+    device = M.device
+    imgs, recs = [], []
+    for p in paths:
+        rec = dict(file=Path(p).name, path=str(p), route="", p_ng=None,
+                   pred="", thr=None, error="")
+        try:
+            imgs.append(Image.open(p).convert("RGB"))
+        except Exception as e:
+            imgs.append(None); rec["pred"] = "ERROR"; rec["error"] = f"open:{type(e).__name__}:{e}"
+        recs.append(rec)
+
+    valid = [i for i, im in enumerate(imgs) if im is not None]
+    if not valid:
+        return recs
+    # Stage1
+    try:
+        x1 = torch.stack([pre_stage1(imgs[i]) for i in valid]).to(device)
+        with _amp_ctx(use_amp, device):
+            r = F.softmax(M.stage1(x1), 1).argmax(1).cpu().numpy()
+        for j, i in enumerate(valid):
+            recs[i]["route"] = STAGE1_CLASSES[int(r[j])]
+    except Exception as e:
+        for i in valid:
+            recs[i]["pred"] = "ERROR"; recs[i]["error"] = f"stage1:{type(e).__name__}:{e}"
+        return recs
+
+    # Stage2 (route별 그룹 배치)
+    def run_group(route, model, pre, thr):
+        idxs = [i for i in valid if recs[i]["route"] == route and recs[i]["pred"] != "ERROR"]
+        if not idxs:
+            return
+        if model is None:
+            for i in idxs:
+                recs[i]["pred"] = "ERROR"; recs[i]["error"] = f"{route}_model_미로드"
+            return
+        try:
+            x = torch.stack([pre(imgs[i]) for i in idxs]).to(device)
+            with _amp_ctx(use_amp, device):
+                png = F.softmax(model(x), 1)[:, 0].float().cpu().numpy()
+            for k, i in enumerate(idxs):
+                pv = float(png[k])
+                recs[i]["p_ng"] = pv; recs[i]["thr"] = thr
+                recs[i]["pred"] = "NG" if pv >= thr else "OK"     # ★ p_ng >= threshold
+        except Exception as e:
+            for i in idxs:
+                recs[i]["pred"] = "ERROR"; recs[i]["error"] = f"{route}:{type(e).__name__}:{e}"
+
+    run_group("color", M.color, pre_color, COLOR_THR)
+    run_group("tint",  M.tint,  pre_tint,  TINT_THR)
+    for i in valid:                       # empty → 즉시 NG
+        if recs[i]["route"] == "empty" and recs[i]["pred"] != "ERROR":
+            recs[i]["pred"] = "NG"; recs[i]["thr"] = None; recs[i]["p_ng"] = None
+    return recs
+
+def iter_chunks(seq, bs):
+    for i in range(0, len(seq), bs):
+        yield seq[i:i + bs]
+
+# ── 유틸 ─────────────────────────────────────────────────────────────────────
+def gather_images(inp):
+    p = Path(inp)
+    if p.is_file():
+        return [p] if p.suffix.lower() in IMG_EXTS else []
+    return sorted([q for q in p.rglob("*")
+                   if q.suffix.lower() in IMG_EXTS and not any(s.startswith(".") for s in q.parts)])
+
+def fmt_png(v):
+    return "" if v is None else f"{v:.8f}"      # p_ng 최소 8자리
+
+def require_cuda():
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA 미검출 — 이 코드는 GPU 전용입니다(CPU 조용한 실행 금지). "
+                           "NVIDIA 드라이버/CUDA 지원 torch를 확인하세요.")
+    # 재현성: 같은 배치크기에서 run-to-run 결정적. (배치크기가 다르면 p_ng가 ~1e-6 수준
+    #  달라질 수 있으나 판정 p_ng>=thr 결과는 불변. 공장 실시간은 batch=1 고정 권장.)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def print_env():
+    print(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda} | "
+          f"cuDNN {torch.backends.cudnn.version()} | GPU {torch.cuda.get_device_name(0)}")
+
+# ── 메인 추론 실행 ───────────────────────────────────────────────────────────
+def run_inference(args):
+    require_cuda()
+    device = torch.device("cuda")
+    print_env()
+    print(f"[weights] stage1={STAGE1_W.name}  color={COLOR_W.name}  tint={TINT_W.name}")
+    print(f"[thr] color={COLOR_THR}  tint={TINT_THR}  | 판정 p_ng>=thr | AMP={args.amp} | batch={args.batch}")
+    print("[주의] 2-stage 결과는 Stage1 라우팅 오분류를 포함합니다(개별 Stage2 KPI와 다를 수 있음).")
+
+    paths = gather_images(args.input)
+    if not paths:
+        print(f"[!] 이미지를 찾지 못했습니다: {args.input}"); return
+    print(f"[입력] {len(paths):,}장  ({args.input})")
+
+    t0 = time.perf_counter()
+    M = Models(device)
+    torch.cuda.synchronize()
+    load_sec = time.perf_counter() - t0
+    print(f"[모델 로드] {load_sec:.2f}s (이미지 처리시간과 분리 측정)")
+
+    recs_all = []
+    warm = max(0, args.warmup)
+    done = 0
+    for chunk in iter_chunks(paths, args.batch):
+        torch.cuda.synchronize(); c0 = time.perf_counter()
+        recs = classify_chunk(chunk, M, args.amp)
+        torch.cuda.synchronize()
+        each = (time.perf_counter() - c0) * 1000.0 / len(chunk)   # 이미지당 ms(배치는 균등분배)
+        for r in recs:
+            r["proc_ms"] = round(each, 3)
+            r["warmup"] = done < warm                              # 앞 warmup장은 속도통계 제외
+            recs_all.append(r); done += 1
+    # steady-state 통계 (warmup 제외)
+    steady = [r["proc_ms"] for r in recs_all if not r["warmup"] and r["pred"] != "ERROR"]
+    n_err = sum(1 for r in recs_all if r["pred"] == "ERROR")
+
+    # ── CSV 저장 (날짜시간 → 덮어쓰기 없음) ───────────────────────────────────
+    outdir = Path(args.outdir) if args.outdir else (BASE / "inference_results")
+    outdir.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = outdir / f"lens_2stage_inference_{stamp}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["filename", "route", "p_ng", "pred", "threshold", "error", "proc_ms", "warmup", "path"])
+        for r in recs_all:
+            w.writerow([r["file"], r["route"], fmt_png(r["p_ng"]), r["pred"],
+                        ("" if r["thr"] is None else r["thr"]), r["error"],
+                        f'{r["proc_ms"]:.3f}', int(r["warmup"]), r["path"]])
+
+    # ── 요약 ──────────────────────────────────────────────────────────────────
+    from collections import Counter
+    routes = Counter(r["route"] for r in recs_all if r["pred"] != "ERROR")
+    preds = Counter(r["pred"] for r in recs_all)
+    print("\n" + "=" * 60)
+    print(f"[결과] 총 {len(recs_all):,}장  | 라우팅 {dict(routes)}")
+    print(f"       판정 {dict(preds)}  | 오류(손상 등) {n_err}장")
+    if steady:
+        arr = np.array(steady)
+        spi = arr.mean() / 1000.0
+        print(f"[속도] warmup {warm}장 제외 {len(steady):,}장 기준")
+        print(f"       평균 {spi*1000:.2f} ms/장 = {spi:.5f} 초/장 = {spi/60:.6f} 분/매")
+        print(f"       {1.0/spi:.1f} images/sec  |  1,000장 예상 {1000*spi/60:.2f}분")
+    print(f"[CSV] {csv_path}")
+    return csv_path
+
+# ── 컬러 KPI 자체검증 (11,905 test, 캐시 경로 재추론) ─────────────────────────
+def selftest_color(args):
+    require_cuda(); device = torch.device("cuda"); print_env()
+    cache = BASE / "lens_factory_kit/cache/ep3_test_png.npz"
+    corr_p = BASE / "lens_factory_kit/label_corrections.json"
+    if not cache.exists():
+        print(f"[!] 캐시 없음: {cache}"); return
+    import json
+    z = np.load(cache, allow_pickle=True)
+    paths = [Path(str(p)) for p in z["paths"]]
+    ref_png = np.asarray(z["png"], dtype="float32")     # 원본(common_train) p_ng
+    corr = {k: (1 if v.get("new", "OK") == "OK" else 0)
+            for k, v in json.load(open(corr_p, encoding="utf-8")).items()}
+    print(f"[selftest] 컬러 test {len(paths):,}장 재추론 (512/Otsu, AMP={args.amp})")
+
+    color_m = build_4ch(COLOR_W, device)
+    png = np.zeros(len(paths), "float32")
+    for s in range(0, len(paths), args.batch):
+        chunk = paths[s:s + args.batch]
+        xs = []
+        for p in chunk:
+            xs.append(pre_color(Image.open(p).convert("RGB")))
+        x = torch.stack(xs).to(device)
+        with torch.inference_mode(), _amp_ctx(args.amp, device):
+            png[s:s + len(chunk)] = F.softmax(color_m(x), 1)[:, 0].float().cpu().numpy()
+        if s % 2560 == 0:
+            print(f"    {s}/{len(paths)}", end="\r")
+
+    def cat(p):
+        pl = str(p).lower()
+        for key, lab in [("/pure_brown/ng/", 0), ("/pure_brown/ok/", 1), ("/ng_black/", 0),
+                         ("/ok_black/", 1), ("/type_00/ng", 0), ("/type_00/ok", 1)]:
+            if key in pl:
+                return lab
+        return -1
+    labels = []
+    for p in paths:
+        l = cat(p); nm = p.name
+        if nm in corr:
+            l = corr[nm]
+        labels.append(l)
+    labels = np.array(labels); v = labels >= 0
+    def cm(scores):
+        pn = scores[v] >= COLOR_THR; ng = labels[v] == 0
+        return (int((pn & ng).sum()), int((pn & ~ng).sum()),
+                int((~pn & ng).sum()), int((~pn & ~ng).sum()))
+    TP, FP, FN, TN = cm(png)
+    rTP, rFP, rFN, rTN = cm(ref_png)
+    exp = (1374, 27, 26, 10478)
+    print(f"\n  재추론 @0.57(>=): TP={TP} FP={FP} FN={FN} TN={TN}")
+    print(f"  캐시     @0.57(>=): TP={rTP} FP={rFP} FN={rFN} TN={rTN}")
+    print(f"  기대           : TP={exp[0]} FP={exp[1]} FN={exp[2]} TN={exp[3]}")
+    max_diff = float(np.abs(png - ref_png).max())
+    print(f"  p_ng 최대편차(재추론 vs 캐시) = {max_diff:.2e}")
+    ok = (TP, FP, FN, TN) == exp
+    print("  ✅ 일치 — 전처리/index/threshold 동일" if ok else
+          "  ⚠️ 불일치 — AMP를 끄고(--no-amp) 재시도하거나 전처리 점검 필요")
+    return ok
+
+def main():
+    ap = argparse.ArgumentParser(description="네오비전 렌즈 2-stage 추론(공장 배포)")
+    ap.add_argument("--input", help="이미지 파일 또는 폴더(재귀)")
+    ap.add_argument("--batch", type=int, default=1, help="배치 크기(공장 실시간=1 기본; 대량평가시↑, 결과 동일)")
+    ap.add_argument("--warmup", type=int, default=3, help="GPU 워밍업 장수(속도통계 제외)")
+    ap.add_argument("--amp", dest="amp", action="store_true", help="AMP(fp16) 사용")
+    ap.add_argument("--no-amp", dest="amp", action="store_false", help="AMP 끔(기본, 결정적)")
+    ap.set_defaults(amp=False)
+    ap.add_argument("--outdir", default=None, help="CSV 저장 폴더(기본 inference_results/)")
+    ap.add_argument("--selftest-color", action="store_true", help="컬러 KPI(11,905) 재현 검증")
+    args = ap.parse_args()
+
+    if args.selftest_color:
+        selftest_color(args); return
+    if not args.input:
+        ap.error("--input 또는 --selftest-color 를 지정하세요.")
+    run_inference(args)
+
+if __name__ == "__main__":   # Windows 필수
+    main()

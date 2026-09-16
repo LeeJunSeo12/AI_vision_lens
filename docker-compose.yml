@@ -1,0 +1,13 @@
+services:
+  lens-api-ver3:
+    build: .
+    image: lens-defect-api-ver3:latest
+    container_name: lens-defect-api-ver3
+    gpus: all
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_DIR: /app/models
+    volumes:
+      - "C:/Users/neonfamily101/Documents/휴먼비전/Demo_docker_server_ver3/input:/data/input"
+      - "C:/Users/neonfamily101/Documents/휴먼비전/Demo_docker_server_ver3/output:/data/output"
