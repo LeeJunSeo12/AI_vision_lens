@@ -30,12 +30,12 @@
 
 아래 네 개의 모델 파일은 프로젝트 루트 경로에 있어야 합니다. Docker 이미지를 빌드할 때 컨테이너 내부의 `/app/models`로 복사됩니다.
 
-| 파일 | 용도 |
-| --- | --- |
+| 파일                                | 용도                                 |
+| ----------------------------------- | ------------------------------------ |
 | `best_efficientnet_lens_3class.pth` | 1차 분류: `color` / `tint` / `empty` |
-| `lens_hardneg_best.pth` | 2차 color 정상/불량 판정 |
-| `lens_tint_v3_best.pth` | 2차 tint v3 판정 |
-| `lens_tint_dual_ep2_deploy.pth` | 2차 tint v4 앙상블 판정 |
+| `lens_hardneg_best.pth`             | 2차 color 정상/불량 판정             |
+| `lens_tint_v3_best.pth`             | 2차 tint v3 판정                     |
+| `lens_tint_dual_ep2_deploy.pth`     | 2차 tint v4 앙상블 판정              |
 
 > 모델 체크포인트의 용량이 큽니다. GitHub에 올릴 때는 일반 Git 대신 [Git LFS](https://git-lfs.com/)로 관리하는 것을 권장합니다.
 
@@ -144,21 +144,21 @@ output/
 
 감시 동작의 기본값은 [`app/config.py`](app/config.py)에서 변경할 수 있습니다.
 
-| 설정 | 기본값 | 설명 |
-| --- | --- | --- |
-| `WATCH_ENABLED` | `True` | 폴더 자동 감시 사용 여부 |
-| `WATCH_POLL_INTERVAL_SECONDS` | `1.0` | 폴더 스캔 주기(초) |
-| `WATCH_FILE_STABLE_SECONDS` | `1.0` | 이미지 처리 전 파일 안정화 대기 시간(초) |
+| 설정                              | 기본값  | 설명                                        |
+| --------------------------------- | ------- | ------------------------------------------- |
+| `WATCH_ENABLED`                   | `True`  | 폴더 자동 감시 사용 여부                    |
+| `WATCH_POLL_INTERVAL_SECONDS`     | `1.0`   | 폴더 스캔 주기(초)                          |
+| `WATCH_FILE_STABLE_SECONDS`       | `1.0`   | 이미지 처리 전 파일 안정화 대기 시간(초)    |
 | `WATCH_PROCESS_EXISTING_ON_START` | `False` | 서버 시작 전부터 있던 입력 이미지 처리 여부 |
 
 ## 판정 임계값
 
-| 경로 | 전처리 | 불량(NG) 조건 |
-| --- | --- | --- |
-| Color | 512 px + Otsu 마스크 | `p_ng >= 0.57` |
+| 경로    | 전처리                 | 불량(NG) 조건  |
+| ------- | ---------------------- | -------------- |
+| Color   | 512 px + Otsu 마스크   | `p_ng >= 0.57` |
 | Tint v3 | 384 px + median 마스크 | `p_ng >= 0.50` |
 | Tint v4 | 384 px + median 마스크 | `p_ng >= 0.58` |
-| Empty | — | 항상 `NG` |
+| Empty   | —                      | 항상 `NG`      |
 
 ## 프로젝트 구조
 
@@ -175,20 +175,3 @@ output/
 ├── requirements.txt
 └── *.pth                          # 필수 모델 체크포인트 (Git LFS 권장)
 ```
-
-## GitHub 업로드 및 Git LFS 설정
-
-첫 업로드 전에 아래 명령으로 모델 파일을 Git LFS로 추적하세요.
-
-```powershell
-git lfs install
-git lfs track "*.pth"
-git add .gitattributes *.pth
-git commit -m "Track model checkpoints with Git LFS"
-```
-
-그다음 애플리케이션 파일을 커밋하고 일반적인 방식으로 push하면 됩니다. 네 개의 모델 파일 용량을 저장할 수 있도록 GitHub LFS 저장 공간과 전송량도 확인하세요.
-
-## 라이선스
-
-현재 라이선스 파일이 없습니다. 저장소를 공개할 예정이라면 사용·재배포 범위를 정할 수 있도록 `LICENSE` 파일을 추가하는 것을 권장합니다.
